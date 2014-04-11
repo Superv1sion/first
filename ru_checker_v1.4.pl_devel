@@ -1,0 +1,1413 @@
+#!/usr/bin/perl
+#########################
+use strict;
+use Net::Telnet();
+use DBI;
+#use warnings;
+use Data::Dumper;
+use Switch;
+use Parallel::ForkManager;
+use AnyEvent;
+use AnyEvent::Ping;
+use Socket;
+use Net::SMTP;
+use Encode;
+use MIME::Base64;
+#########################
+my $sw_ip;
+my $sw_model;
+my @row;
+my @rings;
+my @errors;
+my @critical;
+my @warning;
+my %ring_config;
+my %ip_config;
+my %models;
+my $counter;
+my @stp;
+my @dhcp;
+my %ring_vl_type;
+my %alerts;
+#########################
+open FILE, ">>/home/vision/perl_oop/errors.log" or die $!;
+my $start_time = time();
+my $user = 'vision';
+my $pass = '8h1VwHxaD3lm3yIU';	
+my $host='94.76.107.50';
+my $dbh = DBI->connect("dbi:mysql:billing:$host", "$user", "$pass");
+$dbh -> {mysql_auto_reconnect} = 1;
+if (@ARGV){
+push @rings, $ARGV[0];
+}else{
+my $sql="select concat(r.prefix,'.',r.net) as ring, r.prefix, r.net 
+	from rings r 
+	join switches sw on concat(r.prefix,'.',r.net)=substring_index(sw.ip,'.',3) 
+	join houses h on sw.h_id=h.h_id 
+	join segment seg on h.seg_no=seg.seg_no 
+	where seg.dhcp_enable>0
+	group by ring";
+	 #"select concat(prefix,'.',net) as ring, prefix, net from rings group by ring;";
+my $sth= $dbh->prepare($sql);
+$sth->execute or die "SQL Error: $DBI::errstr\n";
+while (@row  = $sth->fetchrow_array){
+	my $ring = shift @row;
+	push @rings, $ring;
+}
+}
+#print Dumper \@rings;
+for my $ring (@rings){
+		my %sw_config;
+		my %omg;
+		my $pm = new Parallel::ForkManager(100);
+		
+		
+	$pm->run_on_finish (sub{
+	#	print Dumper @_;
+		$sw_config{$_[5]->[0]} = $_[5]->[1]; ####### Собираем хэш конфигов со свичей #########
+		
+	});
+		print "work with ring $ring\n";
+		my $prefix;
+		my $net;
+			if ($ring=~m/([0-9]+\.[0-9]+)\.([0-9]+)/){
+				$prefix = $1;
+				$net = $2;
+		}
+	
+		my @vlans;
+		my %instance;
+		my %vlan_type;
+	
+	####################################"Select" for ring config############################
+	my $sql= "select 
+		vl.stp_instance, vl.vlan_num, vl.type 
+		from rings r 
+		join vlans_rings v_r on r.id=v_r.ring_id 
+		join vlans vl on v_r.vlan_id=vl.id 
+		where 
+			prefix='$prefix' and 
+			net=$net";
+	my $stv= $dbh->prepare($sql);
+	$stv->execute or die "SQL Error: $DBI::errstr\n";
+	while (@vlans = $stv->fetchrow_array){
+	
+		my $instance = shift @vlans;
+		
+		#if ($instance ne '0'){
+		my $vlan = shift @vlans;
+		my $type = shift @vlans;
+		if ($vlan != 4094 ){
+			push @{$instance{$instance}}, $vlan; ########Generate instance=>vlan hash #############
+			$vlan_type{$vlan} = $type;
+			push @{$ring_vl_type{$ring}{$type}}, $vlan;
+		}
+		}
+		#print Dumper \%ring_vl_type;
+		if (!%ring_vl_type){
+		&alerts("No info in bd for ring", $ring);
+		}
+		for my $instance (keys %instance){
+		#print "there \"$instance\"\n";
+		if ($instance eq ""){
+			&alerts("No info in bd for ring", $ring);
+		push @critical, "No info in bd for $ring";
+		$instance = 0;
+		}
+		}
+		#print Dumper \%instance;
+	my @ips = &ping_ring ($ring);
+	
+	#################################### Check model by snmp ##########
+	for my $ip (@ips){
+		chomp $ip;
+	my $version = `snmpwalk -c 74FRfR7ewJar -v 1 $ip iso.3.6.1.2.1.1.1.0`;
+	if ($version =~ m/CLI/){ ############### Generate ip=>model hash ##
+			$models{$ip}="linksys";
+		}elsif ($version=~m/ZTE/){
+			$models{$ip}="ZTE";
+		}elsif ($version=~m/DES/){
+			$models{$ip}="Dlink";
+		}elsif ($version=~m/SPS224G4/){
+			$models{$ip}="linksys";
+		}elsif ($version=~m/FoxGate/){
+			$models{$ip}="foxgate";
+		}
+	}
+	#################################### Check model by snmp ##########
+	
+	for my $ip (@ips){
+		print "Going to $ip\n";
+	my $pid = $pm->start and next; ######### Start fork manager;
+	
+	my $telnet = &connect($ip, $models{$ip}, $pm); ############ Establishing connection with switch 
+	
+	$pm->finish(0,[$ip, &get_config ($ip, $models{$ip}, $telnet, \%{$ring_vl_type{$ring}})]); ############### Finish process and adding configuration to hash
+	}
+	$pm->wait_all_children;
+	#print Dumper \%sw_config;
+	&compare_config (\%sw_config, \%instance, \%ring_vl_type );
+}
+
+my ($errors, $warning, $critical);
+######################### Errors section ###############################
+for (@errors){
+#$errors.="$_\n";
+print "$_\n";
+}
+#print "Warnings!!!\n##################\n\n";
+for (@warning){
+	#print "$_\n";
+$warning.="$_\n";
+}
+#print "\nCritical!!!\n####################\n\n";
+for (@critical){
+	#print "$_\n";
+$critical.="$_\n";
+}
+for my $ip (sort (keys %alerts)){
+	for (@{$alerts{$ip}}){
+		print "$ip: $_\n";
+	}
+}
+#print Dumper \%alerts;
+&report_gen (\%alerts);
+#&send_report($errors, $warning, $critical);
+
+######################### Errors section ###############################
+
+##########################Send report ##################################
+sub send_report {
+
+	my %alerts = %{ $_[0] };
+	my %region_ip = %{ $_[1] };
+	my %region_recipients = %{ $_[2] };
+	my $total;
+	my $dhcp = $#dhcp+1;
+	my $stp = $#stp+1;
+	my $smtp = Net::SMTP->new('mail.o3.ua');
+	my $smtp2 = Net::SMTP->new('mail.o3.ua');
+	#print Dumper \%region_recipients;
+	print Dumper \%region_ip;
+	print Dumper \%alerts;
+	for my $reg (keys %region_recipients){
+		print "Creating mail for $reg\n";
+		$total.="Errors in $reg:\n";
+		my $m_body;
+		my $region = decode("utf8", $reg);
+
+		for my $ip (@{$region_ip{$reg}}){
+			for my $alert (@{$alerts{$ip}}){
+				#print "ip - $ip:  alert - $alert\n";
+				$m_body.="$ip: $alert\n";
+				$total.="$ip: $alert\n";
+			}
+		}
+	
+		my @send_list = split (',', $region_recipients{$reg});
+		#print Dumper \@send_list;
+		$smtp->mail('g.oganesyan@o3.ua');        # Address for delivery failure
+    	for my $rec (@send_list){
+			$smtp->to($rec);
+		}
+		$smtp->to('g.oganesyan@o3.ua');
+    	#$smtp->to('g.oganesyan@o3.ua');    # Recipient/recipients
+    	$smtp->data();
+    	$smtp->datasend("To: $region_recipients{$reg}\n");
+    	$smtp->datasend("From: ru_checker\@o3.ua\n");
+    #	$smtp->datasend("Cc: taran2l\@o3.ua\n");
+    	$smtp->datasend("Subject: [Alert] Config errors report ($region)\n");                       # Letter subject
+    	$smtp->datasend("\n");
+ #  	 $smtp->datasend("Script errors:\n\n" . "$errors\n\n" );  
+    	$smtp->datasend("Warnings!!!\n##################\n\n" . "$m_body\n\n" );
+    	$smtp->dataend();
+ 	  	$smtp->quit;
+    }
+
+    $smtp2->mail('g.oganesyan@o3.ua');
+    $smtp2->to('g.oganesyan@o3.ua','duty@o3.ua');
+    $smtp2->data();
+    $smtp2->datasend("To: bla-bla-bla\@o3.ua\n");
+    $smtp2->datasend("From: ru_checker\@o3.ua\n");
+    $smtp2->datasend("Cc: taran2l\@o3.ua\n");
+    $smtp2->datasend("Subject: [Alert] Config errors report (Total)\n");                       # Letter subject
+    $smtp2->datasend("\n");
+    $smtp2->datasend("Script errors:\n\n" . "$errors\n\n" );  
+    $smtp2->datasend("Warnings!!!\n##################\n\n" . "$total\n\n" );
+ #   $smtp->datasend("\nCritical!!!\n####################\n\n" . "$critical\n\n" );             # Message body
+    $smtp2->datasend("\n\nTotal dhcp's errors: " . "$dhcp\n\n" );
+    $smtp2->datasend("\n\nTotal stp's errors: " . "$stp\n\n" );
+    $smtp2->dataend();
+    $smtp2->quit;
+    print FILE ~~localtime."\n";
+    print FILE "Total dhcp's errors: $dhcp \nTotal stp's errors: $stp\n";
+    print FILE "\n################################\n";
+}
+
+sub alerts {
+	my $alerts = shift;
+	my $ip = shift;
+
+	push @{$alerts{$ip}}, $alerts;
+	#print Dumper \%alerts;
+	#return 1;
+}
+
+sub report_gen {
+	my %alerts = %{ $_[0] };
+	my %region_ip;
+	my %region_recipients;
+	for my $ip (keys %alerts){
+		if ($ip=~m/172\.(11|17|19|26|28|27)\.[0-9]+\.?[0-9]*/){
+			my $reg="Дарницкий ЦОА";
+			push @{$region_ip{$reg}}, $ip;
+			$region_recipients{$reg} ="g.oganesyan\@o3.ua";#d.zinchuk\@o3.ua";
+		}
+		if ($ip=~m/172\.(18|16)\.[0-9]+\.?[0-9]*/){
+			my $reg="Деснянский ЦОА";
+			push @{$region_ip{$reg}}, $ip;
+			$region_recipients{$reg}="s.yasinskiy\@o3.ua";
+		}
+		if ($ip=~m/172\.23\.[0-9]+\.?[0-9]*/){
+			my $reg="г. Симферополь";
+			push @{$region_ip{$reg}}, $ip;
+			$region_recipients{$reg}="kiman\@o3.ua";#
+		}
+		if ($ip=~m/172\.29\.[0-9]+\.?[0-9]*/){
+			my $reg="г. Бердичев";
+			push @{$region_ip{$reg}}, $ip;
+			$region_recipients{$reg}="vvvarnavskiy\@o3.ua,ber.support\@o3.ua,nykonenko\@o3.ua";#"g.oganesyan\@o3.ua";#
+		}
+		if ($ip=~m/172\.(22|118)\.[0-9]+\.?[0-9]+/){
+			my $reg="г. Житомир";
+			push @{$region_ip{$reg}}, $ip;
+			$region_recipients{$reg}="nykonenko\@o3.ua";
+		}
+		if ($ip=~m/172\.24\.[0-9]+\.?[0-9]*/){
+			my $reg="г. Ивано-Франковск";
+			push @{$region_ip{$reg}}, $ip;
+			$region_recipients{$reg}="o.kedenko\@o3.ua";
+		}
+		if ($ip=~m/172\.20\.[0-9]+\.?[0-9]*/){
+			my $reg="г. Львов";
+			push @{$region_ip{$reg}}, $ip;
+			$region_recipients{$reg}="ADerevyanchenko\@o3.ua,t.bezdil\@o3.ua";
+		}
+		if ($ip=~m/172\.30\.[0-9]+\.?[0-9]*/){
+			my $reg="г. Мелитополь";
+			push @{$region_ip{$reg}}, $ip;
+			$region_recipients{$reg}="konkov\@o3.ua";
+		}
+		if ($ip=~m/172\.25\.[0-9]+\.?[0-9]*/){
+			my $reg="г. Севастополь";
+			push @{$region_ip{$reg}}, $ip;
+			$region_recipients{$reg}="duty\@o3.ua";
+		}
+		if ($ip=~m/172\.31\.[0-9]+\.?[0-9]*/){
+			my $reg="г. Черняхов";
+			push @{$region_ip{$reg}}, $ip;
+			$region_recipients{$reg}="duty\@o3.ua";
+		}
+		if ($ip=~m/172\.21\.[0-9]+\.?[0-9]*/){
+			my $reg="г. Днепропетровск";
+			push @{$region_ip{$reg}}, $ip;
+			$region_recipients{$reg}="e.maksyuta\@o3.ua";
+		}
+	}
+	
+	&send_report(\%alerts, \%region_ip, \%region_recipients);
+}
+##########################Send report ##################################
+
+############################# Compare config ###########################
+sub compare_config {
+	
+	print "Start compare config!!!\n";
+	my %sub_config = %{ $_[0] };
+	my %instance = %{ $_[1] };
+	my %ring_vl_type = %{ $_[2] };
+	my $stp=0;
+	#print Dumper \%sub_config;
+	#print Dumper \%sub_config;
+	for my $ip (keys %sub_config){ ##################### Парсим конфиг коммутаторов
+	
+		if ($sub_config{$ip} eq "kill"){ ################### Не парсим, конфига нет.
+			next;
+		}
+#######################Getting some stuff ############################
+	#print "Work with $ip\n";
+	my %trunks;
+	my %accesses;
+
+	if ($models{$ip} eq "Dlink"){
+		if (@{ $sub_config{$ip}{"vlan"} }){
+			for my $conf ( @{ $sub_config{$ip}{"vlan"} } ){
+				if ($conf =~m/Current\sUntagged\sPorts\s*:\s*([0-9-,]+)/i){		
+					#print "$conf\n";	
+					%accesses = (%accesses, &port_separator($1, $models{$ip}));
+			    }
+
+			    if ($conf =~m/Current\sTagged\sPorts\s+:\s([0-9-,]+)/){
+			    	%trunks = (%trunks, &port_separator ($1, $models{$ip}));
+			    }
+			}
+		}else{
+			&alerts("Can't get trunk ports", $ip);
+		}
+	}
+	#print Dumper \%trunks;
+	#print Dumper \%accesses;
+	if ($models{$ip} eq "linksys"){
+		if (@{ $sub_config{$ip}{"trunks"} }){
+			for my $conf ( @{ $sub_config{$ip}{"trunks"} } ){
+				if ($conf =~m/[0-9]+\s+[0-9]+\s+([eg0-9-,)(]+)\s.*/){
+					if ($1=~m/^(g)\(([0-9-,]*)\)$/){
+						#%trunks=
+						%trunks = (%trunks, &port_separator($2, $models{$ip}, $1));
+
+					}
+					if ($1=~m/^(e)\(?([0-9-,]*)\)?$/){
+						%trunks = (%trunks, &port_separator($2, $models{$ip}, $1));
+
+					}
+					if ($1=~m/^(e)\(?([0-9-,]*)\)?,(g)\(?([0-9-,]*)\)?$/){
+						%trunks = (%trunks, &port_separator($2, $models{$ip}, $1));
+						%trunks = (%trunks, &port_separator($4, $models{$ip}, $3));
+					}
+				}
+			}
+		}else{
+			&alerts("Can't get trunk ports", $ip);
+		}
+	}
+
+	if ($models{$ip} eq "foxgate"){
+	#	print Dumper \%sub_config;
+		if (@{ $sub_config{$ip}{"vlan"} }){
+			for my $conf (@{ $sub_config{$ip}{"vlan"} }){
+				if ($conf=~m/^Static\s+untagged\s+Ports\s*:\s+([e0-9\/,-]+)./i){
+						%accesses = (%accesses, &port_separator($1, $models{$ip}));
+				}
+			}
+		}else{
+			&alerts("Can't get trunk ports", $ip);
+		}
+		if (@{ $sub_config{$ip}{"trunks"} }){
+			for my $conf (@{ $sub_config{$ip}{"trunks"} }){
+				if ($conf=~m/^Static\s+tagged\s+ports\s*:\s+([e0-9\/,-]+)./i){
+						%trunks = (%trunks, &port_separator($1, $models{$ip}));
+				}
+			}
+		}else{
+			&alerts("Can't get trunk ports", $ip);
+		}	
+	}
+#print Dumper \%accesses;
+#print Dumper \%trunks;
+##############################End#####################################
+
+&check_dhcp (\%{$sub_config{$ip}}, $ip, \%trunks, \%accesses);
+&check_iptv (\%{$sub_config{$ip}}, $ip, \%ring_vl_type);
+&check_portfast (\%{$sub_config{$ip}}, $ip, \%trunks, \%accesses);
+	my %vlans;
+	my %vlan;
+	#print Dumper %instance;
+	#print "$models{$ip}\n";
+	my $priority =32768;
+	
+	for my $ins (keys %instance){
+	if ($ins>0){
+		if ($models{$ip} eq "ZTE"){
+			$stp=0;
+			for my $conf ( @{ $sub_config{$ip}{"config"} } ){
+				
+					if ($conf =~m/set stp enable/){
+						$stp=1;
+					}
+					if ($conf =~m/set stp instance $ins add vlan ([0-9,-]+)/){
+						push @{$vlans{$ins}}, split (/,/, $1);
+					}
+				}
+				if ($stp==0){
+					push @critical, "$ip - stp works bad";
+					&alerts("stp works bad", $ip);
+					push @stp, "bad";
+					last;
+				}
+			}elsif ($models{$ip} eq "linksys"){
+				$stp=0;
+				for my $conf ( @{ $sub_config{$ip}{"stp"} } ){
+					if ($conf =~m/$ins\s+([0-9,-]+)\s+enabled/){
+						#print "$conf\n";
+						$stp=1;
+				
+						push @{$vlans{$ins}}, split (/,/, $1);
+					}
+				}
+				if ($stp==0){
+					&alerts("stp works bad", $ip);
+					push @critical, "$ip - stp works bad";
+					push @stp, "bad";
+					last;
+				}
+			}elsif ($models{$ip} eq "Dlink"){
+
+				$stp=0;
+				#print Dumper \@{ $sub_config{$ip}{"stp"} };
+				for my $conf ( @{ $sub_config{$ip}{"stp"} } ){
+					if ($conf =~m/^\s+$ins\s*([0-9,-]+)\s*/){
+						$stp=1;
+						push @{$vlans{$ins}}, split (/,/, $1);
+					}
+					if ($conf =~m/Instance\s+Priority\s*:\s([0-9]+)\s*\(.*/i){
+						$priority = $1;
+					}
+				}
+				if ($stp==0){
+					&alerts("stp works bad", $ip);
+					push @critical, "$ip - stp works bad";
+					push @stp, "bad";
+					last;
+				}
+			}elsif($models{$ip} eq "foxgate"){
+				for my $conf ( @{ $sub_config{$ip}{"stp"} } ){
+					if ($conf=~m/^instance\s*$ins\s+:\s*([0-9,-]+)/){
+						my %temp = &port_separator ($1);
+						@{$vlans{$ins}} = keys %temp;
+					}
+				}
+			}
+		}
+	}
+#	print Dumper \%vlans;
+	#########################################Vlan cheking ############################################
+	if ($models{$ip} eq "ZTE"){
+			for my $conf ( @{ $sub_config{$ip}{"config"} } ){
+						
+				if ($conf =~m/set vlan ([0-9]+) enable/ and $1!=1){
+						$vlan{$1}="";
+				}
+			}
+		}elsif ($models{$ip} eq "linksys"){
+			$stp=0;
+			for my $conf ( @{ $sub_config{$ip}{"vlan"} } ){
+				if ($conf =~m/([0-9]+)\s*.*/ and $1!=1){
+					$vlan{$1}="";
+				}
+			}
+		}elsif ($models{$ip} eq "Dlink"){
+			
+			for my $conf ( @{ $sub_config{$ip}{"vlan"} } ){
+				if ($conf =~m/VID\s*:\s*([0-9]+)\s.*/ and $1!=1){
+					$vlan{$1}="";
+				}
+			}
+		}
+	
+	#print Dumper \%vlan;
+
+	for my $ins (keys %vlans){
+	my @temp_vlan;
+	for my $vlans (@{ $vlans{$ins} }){
+		#print "vlans in $ins $vlans\n";
+		if ($vlans=~/([0-9]*)-([0-9]*)/){
+			for ($1..$2){
+				push @temp_vlan, $_;
+			}
+		}else{
+			push @temp_vlan, $vlans;
+			}
+		}
+		@{ $vlans{$ins} } = @temp_vlan;
+	}
+#####################STP check begin############################
+my $vlans;
+
+&alerts("high priority for zero instance", $ip) if $priority <4097;
+
+for my $ins (keys %instance) { ############### Сравнение stp со свича с stp в базе.
+if ($ins>0){
+	my $stp_vlans;
+	my $stp =0;
+	
+ for my $bd_vlans (@{ $instance{$ins}}){
+	$stp=1;
+
+ for my $sw_vlans (@{ $vlans{$ins}}){
+	if ($bd_vlans eq $sw_vlans){
+	
+	$stp=0;
+	}
+ }
+ #print "counter $count after compare\n";
+ if ($stp == 1){
+ $stp_vlans.="$bd_vlans ";
+ }
+ }
+ chop $stp_vlans;
+ if ($stp_vlans ne ""){
+ 	&alerts("can't find vlans: \"$stp_vlans\" in $ins instance", $ip);
+ 	#$alerts{$ip} = "can't find vlans: \"$stp_vlans\" in $ins instance";
+ push @warning, "$ip can't find vlans: \"$stp_vlans\" in $ins instance";
+
+ push @stp, "bad";
+	}
+}
+}
+#####################STP check end############################
+#print Dumper \%alerts;
+
+#print Dumper \%instance;
+#print Dumper \%vlan;
+for my $ins (keys %instance) {
+	my $vlan =0;
+	for my $bd_vlans (@{ $instance{$ins}}){
+
+	 $vlan =1;
+	 for my $vlans ( keys %vlan){
+		
+	 if ($bd_vlans eq $vlans){
+			$vlan =0;
+		}
+	
+	 }
+	if ($vlan == 1){
+		$vlans.="$bd_vlans ";
+		}
+	}
+}
+	if ($vlans ne ""){
+		
+		#push @critical, "$ip can't find vlans: $vlans in switch";
+		
+		}
+
+   ######Formating DB vlans########
+       my @vlan_db;
+       		for my $ins ( keys %instance) {
+			for my $bd_vlans ( @{ $instance{$ins} } ){
+				push @vlan_db, $bd_vlans;
+			}
+		}
+	######Formating DB vlans########
+	
+	my $miss_vlan;
+	for my $vlan ( keys %vlan){
+		my $vl = 1;
+		for my $vlan_db ( @vlan_db){
+		if ($vlan eq $vlan_db){
+			$vl =0;
+			}
+		}
+		if ($vl == 1){
+		$miss_vlan.="$vlan ";
+		}
+	}
+    if ($miss_vlan ne ""){
+		if ($miss_vlan == 4094){
+			&alerts("find gerkon's vlan $miss_vlan", $ip);
+		push @warning, "$ip find gerkon's vlan $miss_vlan";
+		}else{
+#	push @warning, "$ip can't find vlans: $miss_vlan in Billing DB";
+	}
+	}
+}
+### End of subroutine ###
+#print Dumper \%vlan;
+}
+
+sub check_dhcp {
+################### Let's check fucking DHCP #####################
+	my %sub_config = %{ $_[0] };
+	my $ip = $_[1];
+	my %trunks = %{ $_[2] };
+	my %accesses = %{ $_[3] };
+	my $snooping = 0;
+	my $server = 0;
+	my %ports;
+	my @port;
+	my $user_vlan;
+	#print Dumper \%ring_vl_type;
+	for my $ring (keys %ring_vl_type){
+		if (@{$ring_vl_type{$ring}{"user"}} == 1){
+			$user_vlan = ${$ring_vl_type{$ring}{"user"}}[0];
+		}
+	}	
+	#print Dumper \%ring_vl_type;
+	if ($models{$ip} eq "ZTE"){
+		for my $conf (@{$sub_config{"config"}}){
+			if ($conf=~m/set vlan ([0-9]+) add port ([0-9,-]+) tag/ and $1!='1' ){
+				%ports = &port_separator($2,$models{$ip});
+			}
+		}
+
+		for my $conf (@{$sub_config{"config"}}){
+		
+			if ($conf=~m/set dhcp snooping-and-option82 enable/){
+				#print "Found!\n";
+				$snooping= 1;
+			}
+			if ($conf=~m/set dhcp port ([0-9,-]+) server/){
+				push @port, split (/,/, $1);
+				#print "$1\n";
+				#print Dumper \@port;
+				for (@port){
+					my $port = $_;
+					if ($port=~/([0-9]*)-([0-9]*)/){
+						for ($1..$2){
+							$ports{$_}="dhcp";
+						}
+					}else{
+						$ports{$port}="dhcp";
+					}
+				}
+			}
+		}
+		#print Dumper \%ports;
+		my $temp;
+		for my $port (sort {$a<=>$b} keys %ports){
+			if ($ports{$port} ne "dhcp"){
+				$temp.="$port,";
+			}
+		}
+
+		if ($temp){
+				$temp = &port_group ($temp);
+				&alerts("no dhcp config on trunk port: $temp", $ip);
+				push @warning, "$ip no dhcp config on trunk port: $temp";
+				push @dhcp, "bad";
+		}
+	#	print Dumper \%ports;
+	#	die;
+		if ($snooping eq "0"){
+			#print "$server\n";
+			#print "$snooping\n";
+			&alerts("disabled dhcp-snooping", $ip);
+			push @warning, "$ip disabled dhcp-snooping";
+			push @dhcp, "bad";
+		}
+	}
+	if ($models{$ip} eq "Dlink"){
+		my %filt_ports;
+		my $bad_ports;
+		for my $conf (@{$sub_config{"dhcp"}}){
+		#	print "$conf\n";
+			if ($conf=~m/DHCP\/BOOTP\s*Local\s*Relay\s*Status\s*:\s*Enabled/i){
+				$snooping= 1;
+			}
+		if ($conf =~m/Enabled ports\s*:\s*([0-9-,]+)?/i){
+			
+			%filt_ports = &port_separator ($1, $models{$ip});
+			#print Dumper \%filt_ports;
+			for my $ports (sort {$a<=>$b} keys %accesses){
+				$bad_ports = "$ports," if !$filt_ports{$ports};
+			}
+			$bad_ports = port_group($bad_ports);
+			&alerts("can't find dhcp filters on client's ports: $bad_ports", $ip) if $bad_ports;
+			push @dhcp, "bad" if $bad_ports;
+			undef $bad_ports;
+			for my $ports (sort {$a<=>$b} keys %trunks){
+				$bad_ports = "$ports," if $filt_ports{$ports};
+			}
+			&alerts("find dhcp filters on trunk ports: $bad_ports", $ip) if $bad_ports;
+			push @dhcp, "bad" if $bad_ports;
+			#unless ($1) {
+			#	&alerts("can't find dhcp filters", $ip);
+			#	push @warning, "$ip - can't find dhcp filters";
+			#	
+			#}
+		}
+		#print Dumper \@{$sub_config{"dhcp"}};
+		my %port_bind;
+
+		############################# DES-3200-26 A1 ###################################
+		if ($conf =~m/Port\s+State\s+Mode\s+Zero IP\s+DHCP\s+Packet\s+Stop\s+Learning/){
+
+			for my $conf (@{$sub_config{"dhcp"}}){
+				if ($conf =~m/([0-9]*)\s*\w+\s*(\w+)\s+((?:Not\s)?Allow)\s+.*/i){
+					$port_bind{$1}{"mode"}=$2;
+					$port_bind{$1}{"zero"}=$3;
+				}
+			}
+			my $bad_ports;
+			for my $ports (sort {$a<=>$b} keys %accesses){
+				if ($port_bind{$ports}{"mode"} ne "ARP"){$bad_ports.="$ports,";}
+			}
+			$bad_ports = port_group($bad_ports);
+			push @warning, "$ip: ports without ARP-inspection: $bad_ports" if $bad_ports;
+			&alerts("ports without ARP-inspection: $bad_ports", $ip) if $bad_ports;
+			undef $bad_ports;
+			for my $ports (sort {$a<=>$b} keys %accesses){
+				if ($port_bind{$ports}{"zero"} ne " Allow"){$bad_ports.="$ports,";}
+			}
+			$bad_ports = port_group($bad_ports);
+			&alerts("ports where Zero IP not allowed: $bad_ports", $ip) if $bad_ports;
+			push @warning, "$ip: ports where Zero IP not allowed: $bad_ports" if $bad_ports;
+		}
+
+		############################# DES-3200-26 C1 ###################################
+		if ($conf =~m/Port\s*ARP\s*IP\s*Protocol\s*Zero\s*IP\s*DHCP\s*Packet\s*Stop\s*Learning/){
+
+			for my $conf (@{$sub_config{"dhcp"}}){
+				if ($conf =~m/\s([0-9]*)\s*(\w+)\s*\w+\s+[a-z0-9]+\s+((?:Not\s+)?Allow)\s*.*/i){
+					$port_bind{$1}{"arp"}=$2;
+					$port_bind{$1}{"zero"}=$3;
+				}
+			}
+			#print Dumper \%port_bind;
+			#print Dumper \%accesses;
+			my $bad_ports;
+			for my $ports (sort {$a<=>$b} keys %accesses){
+				if ($port_bind{$ports}{"arp"} ne "Strict"){$bad_ports.="$ports,";}
+			}
+			$bad_ports = port_group($bad_ports);
+			push @warning, "$ip: ports without ARP-inspection: $bad_ports" if $bad_ports;
+			&alerts("ports without ARP-inspection: $bad_ports", $ip) if $bad_ports;
+			undef $bad_ports;
+			for my $ports (sort {$a<=>$b} keys %accesses){
+				if ($port_bind{$ports}{"zero"} =~ m/Not\s+Allow/){$bad_ports.="$ports,";}
+			}
+			$bad_ports = port_group($bad_ports);
+			&alerts("ports where Zero IP not allowed: $bad_ports", $ip) if $bad_ports;
+			push @warning, "$ip: ports where Zero IP not allowed: $bad_ports" if $bad_ports;
+		}
+
+		############################### DES-3526 #######################################
+		if ($conf =~m/Port\s+State\s+Zero\sIP\s+DHCP\sPacket\s+Stop\sLearning/){
+
+			for my $conf (@{$sub_config{"dhcp"}}){
+				if ($conf =~m/([0-9]*)\s*(\w+)\s+((?:Not\s+)?Allow)\s+.*/i){
+					$port_bind{$1}{"state"}=$2;
+					$port_bind{$1}{"zero"}=$3;
+				}
+			}
+			#print Dumper \%port_bind;
+			#print Dumper \%accesses;
+			my $bad_ports;
+			for my $ports (sort {$a<=>$b} keys %accesses){
+				if ($port_bind{$ports}{"state"} ne "Strict"){$bad_ports.="$ports,";}
+			}
+			$bad_ports = port_group($bad_ports);
+			push @warning, "$ip: address binding disabled on ports: $bad_ports" if $bad_ports;
+			&alerts("address binding disabled on ports: $bad_ports", $ip) if $bad_ports;
+			undef $bad_ports;
+			for my $ports (sort {$a<=>$b} keys %accesses){
+				if ($port_bind{$ports}{"zero"} ne "Allow"){$bad_ports.="$ports,";}
+			}
+			#print Dumper \%accesses;
+			#print "$bad_ports\n";
+			$bad_ports = port_group($bad_ports);
+			&alerts("ports where Zero IP not allowed: $bad_ports", $ip) if $bad_ports;
+			push @warning, "$ip: ports where Zero IP not allowed: $bad_ports" if $bad_ports;
+		}
+	}
+		if ($snooping eq "0"){
+			&alerts("DHCP snooping disabled", $ip);
+			push @warning, "$ip: DHCP snooping disabled";
+			push @dhcp, "bad";
+		}
+	}
+
+	if ($models{$ip} eq "linksys"){
+		my @arr = keys %trunks;
+		my @temp;
+
+		for my $conf (@{$sub_config{"dhcp"}}){
+			if ($conf=~m/DHCP\ssnooping\sis\sconfigured\son\sfollowing\sVLANs: ([0-9,-]*)/){
+				my @vlan_temp;
+				my %vlan_temp;
+				push @vlan_temp, split (/,/, $1);
+				for my $vlan (@vlan_temp){
+				   	if ($vlan=~/([0-9]+)-([0-9]+)/){
+				    	for ($1..$2){
+				    		$vlan_temp{$_}='yes';
+				    	}
+					}else{
+						$vlan_temp{$vlan}='yes';        
+					}
+				}
+				#print Dumper \%vlan_temp;
+				if ($vlan_temp{$user_vlan} ne "yes"){
+					&alerts("disabled DHCP snooping on client's vlan $user_vlan", $ip);
+					push @warning, "$ip: disabled DHCP snooping on client's vlan $user_vlan";
+					push @dhcp, "bad";
+				}
+			}
+			if ($conf=~m/((?:g|e)[0-9]+)\s*Yes/){
+				push @temp, $1;
+			}
+		}
+		
+			for (my $i =0; $i<@arr; $i++){
+				for (@temp){
+					if ($arr[$i] eq $_){
+						delete $arr[$i];
+						#splice (@arr, $i, 1);
+					}
+				}
+			}
+
+		my $ports;
+		for (@arr){$ports.="$_,";}
+		$ports = port_group($ports);
+		push @warning, "$ip: trunk ports DHCP untrusted: $ports" if $ports;
+		&alerts("trunk ports DHCP untrusted: $ports", $ip) if $ports;
+		#print Dumper \@arr;
+	}
+
+	if ($models{$ip} eq "foxgate"){
+		my $bad_access;
+		my $bad_trunk;
+		for my $conf (@{$sub_config{"dhcp"}}){
+			if ($conf=~m/DHCP\sSnooping\sstatus:(\w+)/){
+				push @warning, "$ip: disabled DHCP snooping" if $1 ne "Enable";
+				&alerts("disabled DHCP snooping", $ip) if $1 ne "Enable";
+			}
+			if ($conf=~m/(e0\/[0-1]\/[0-9]+)\s+untrust/){
+				$trunks{$1}="untrust" if $trunks{$1};
+			}
+			if ($conf=~m/(e0\/[0-1]\/[0-9]+)\s+trust/){
+				$accesses{$1}="trust" if $accesses{$1};
+			}
+		}
+		for my $ports (sort {$a<=>$b} keys %trunks){
+			$bad_trunk.="$ports," if $trunks{$ports} eq "untrust";
+		}
+		for my $ports (sort {$a<=>$b} keys %accesses){
+			$bad_access.="$ports," if $accesses{$ports} eq "trust";
+		}
+		#chop ($bad_access, $bad_trunk);
+		$bad_access = port_group($bad_access);
+		$bad_trunk= port_group($bad_trunk);
+		push @warning, "$ip: Untrusted trunk ports : $bad_trunk" if $bad_trunk;
+		&alerts("Untrusted trunk ports : $bad_trunk", $ip) if $bad_trunk;
+		push @warning, "$ip: Trusted access ports : $bad_access" if $bad_access;
+		&alerts("Trusted access ports : $bad_access", $ip) if $bad_access;
+	}
+	
+}
+
+sub check_iptv {
+	my %sub_config = %{ $_[0] };
+	my $ip = $_[1];
+	my %ring_vl_type = %{ $_[2]};
+	#print Dumper \@sub_config;
+	#die;
+
+	if ($models{$ip} eq "linksys"){
+	
+	for my $conf (@{$sub_config{"iptv"}}){
+		if ($conf=~m/([0-9]*):\sNo such instance/){
+			push @warning, "$ip: there is no $1 vlan";
+			&alerts("there is no $1 vlan", $ip);
+			}
+		if ($conf=~m/IGMP\sSnooping\sis\sdisabled\son\sVLAN\s([0-9]+)\s/){
+			push @warning, "$ip: IGMP snooping disabled on vlan $1";
+			&alerts("IGMP snooping disabled on vlan $1", $ip);
+			}
+		}
+	}
+}
+
+sub check_portfast {
+	my %sub_config = %{ $_[0] };
+	my $ip = $_[1];
+	my %trunks = %{ $_[2] };
+	my %accesses = %{ $_[3] };
+	if ($models{$ip} eq "linksys"){
+	my $port_counter;
+		for my $conf (@{$sub_config{"portfast"}}){
+			if ($conf =~m/Port\sg4\s.*\sportfast/){
+				last;
+			}
+			if ($conf =~m/configured:(Yes)/){
+				$port_counter++;
+			}
+		}
+		if ($port_counter<24){
+			push @warning, "$ip: find client's ports without Port Fast";
+			&alerts("find client's ports without Port Fast", $ip);
+			push @stp, "bad";
+		}
+	}elsif ($models{$ip} eq "ZTE"){
+		my @ports;
+		my %abon_port;
+		for my $conf (@{$sub_config{"config"}}){
+			if($conf=~m/set vlan ([0-9]*) add port ([0-9,-]*) untag/ and $1!='1' ){
+				push @ports, split (/,/, $2);
+				for my $port (@ports){
+			    	if ($port=~/([0-9]*)-([0-9]*)/){
+				    	for ($1..$2){
+				    		$abon_port{$_}='';
+				    	}
+					}else{
+						$abon_port{$port}='';        
+					}
+		    	}
+			}
+		}
+		for my $conf (@{$sub_config{"config"}}){
+			if($conf=~m/set loopdetect port ([0-9]*) enable/){
+				delete $abon_port{$1};
+			}
+		}
+		
+		my $loop;
+		for my $port (sort {$a<=>$b} keys %abon_port){
+			$loop.="$port,";
+		}
+		$loop = port_group($loop);
+		#chop $loop;
+		if  ($loop){
+			push @warning, "$ip: ports without loopdetect - $loop";
+			&alerts("ports without loopdetect: $loop", $ip);
+			push @stp, "bad";
+		}
+	}elsif ($models{$ip} eq "Dlink"){
+		#print Dumper \$sub_config{'loop'};
+	#	print Dumper \%accesses;
+		for my $conf (@{$sub_config{"loop"}}){
+			if ($conf =~m/([0-9]*)\s*(Disabled|Enabled).*/){
+				if ($2 eq "Disabled"){
+					$accesses{$1}='loop' if $accesses{$1};
+				}
+			}
+		}
+		my $bad_ports;
+		for my $ports (sort {$a<=>$b} keys %accesses){
+			$bad_ports.="$ports," if $accesses{$ports} eq 'loop';
+		}
+		$bad_ports = port_group($bad_ports);
+
+		if ($bad_ports){
+			&alerts("ports without loopdetect: $bad_ports", $ip);
+		}
+	}
+}
+
+############################################################################################################################################
+#######################################################Subroutines !!!!!!!!!!!!!!!!#########################################################
+############################################################################################################################################
+sub ping_ring {
+	my @ips;
+	my $ring = shift;
+	#push @critical, "Errors in ring $ring:";
+	my $c = AnyEvent->condvar;
+my $ping = AnyEvent::Ping->new;
+$ping->timeout(1);
+my $count;
+for (2..254){
+	$count++;
+	my $ip = "$ring.$_";
+	$ping->ping($ip, 1, sub {
+		my $result = shift;
+		if ($result->[0][0] eq 'OK'){
+			push @ips, $ip;
+			}
+		$count--;
+		if ($count == 0){
+			$c->send;
+			}
+	});
+}
+$c->recv;
+return @ips;
+}
+sub port_group{
+	my $ports = shift;
+	chop $ports;
+	my @arr;
+	my @result;
+	my $result;
+	my $first;
+	my $last;
+	my @temp;
+	push @arr, split (/,/, $ports);
+	for (my $i=0; $i<scalar(@arr); $i++ ){
+		my $temp = $arr[$i];
+		for (my $j=$i; $j<scalar(@arr); $j++){
+			if ($arr[$j+1]-$arr[$j]==1){
+				next;
+			}else{
+				if ($temp==$arr[$j]){
+					$result.="$temp,";
+				}else{
+					$result.="$temp-$arr[$j],";
+				}
+				$i=$j;
+				last;
+			}
+		}	
+	}
+	chop $result;
+	$result;
+}
+sub port_separator {
+	my $ports = shift;
+	return 0 if !$ports;
+	my $model = shift;
+	my $tag = shift;
+	my $value = shift;
+	my @ports;
+	my %ports;
+	#print "I've found ports $1\n";
+	if ($model eq "Dlink"){
+		push @ports, split (/,/, $ports);
+		for my $port (@ports){
+		   	if ($port=~/([0-9]*)-([0-9]*)/){
+		    	for ($1..$2){	
+		    		$ports{$_}='exist';
+		    	}
+			}else{
+				$ports{$port}='exist';        
+			}
+		}
+	}elsif ($model eq "linksys"){
+		push @ports, split (/,/, $ports);
+		for my $port (@ports){
+   			if ($port=~/([0-9]*)-([0-9]*)/){
+    			for ($1..$2){
+    			
+    				$ports{"$tag$_"}='';
+    			}
+			}else{
+			
+				$ports{"$tag$port"}='';   
+				}
+			}
+	}elsif($model eq "foxgate"){
+		push @ports, split (/,/, $ports);
+			for my $port (@ports){
+				if ($port=~/^(e0\/[0-1]\/)([0-9]+)-e0\/[0-1]\/([0-9]+)$/){
+					$tag=$1;
+					for ($2..$3){
+    					$ports{"$tag$_"}='yes';
+    				}
+				}else{
+					$ports{"$tag$port"}='yes';
+				}
+			}
+	}else{
+		push @ports, split (/,/, $ports);
+		for my $port (@ports){
+		   	if ($port=~/([0-9]*)-([0-9]*)/){
+		    	for ($1..$2){	
+		    		$ports{$_}="$value";
+		    	}
+			}else{
+				$ports{$port}="$value";        
+			}
+		}
+	}
+		#print Dumper \%ports;
+		#die;
+	return %ports;
+}
+sub get_config {
+	
+#	print "Enter to the subroutine!!! \n\n\n";
+	my $ip = shift;
+	my $model= shift;
+	my $telnet = shift;
+	my $ref = shift;
+	my %ring_vl_type = %{$ref};
+	#print Dumper \%ring_vl_type;
+	my @config;
+	my %prompts;
+	my %config;
+	my %commands;
+	my %command;
+	my %conf;
+	my $key;
+	my @user_vlan;
+	my $mgm_vlan; 
+	my @ring;
+	my $ring;
+	##############Select necessary vlan #################
+	print "Start getting config subroutine $ip\n";
+	push @ring, split (/\./, $ip);
+	#print "$ip\n";
+	pop @ring;
+	$ring = join ('.', @ring);
+	#print Dumper \%ring_vl_type;
+	#die;
+	#my $user_vlan = shift @{$ring_vl_type{"user"}} if @{$ring_vl_type{"user"}} == 1;
+	if (%ring_vl_type){
+		@user_vlan = @{$ring_vl_type{"user"}};
+		$mgm_vlan = shift @{$ring_vl_type{"mgmt"}} if @{$ring_vl_type{"mgmt"}} == 1;
+	}
+	#####################################################
+	##### generating commands ###########
+	push @{$command{"linksys"}}, "sh ip dhcp snooping";
+	push @{$command{"linksys"}}, "sh vlan tag $mgm_vlan" if $mgm_vlan;
+	push @{$command{"linksys"}}, "sh spanning-tree mst-configuration";
+	push @{$command{"linksys"}}, "show vlan";
+	for my $vlan (@user_vlan){
+		push @{$command{"linksys"}}, "sh ip igmp snooping interface $vlan";
+		push @{$command{"foxgate"}}, "show vlan $vlan";
+	}
+	push @{$command{"foxgate"}}, "show vlan $mgm_vlan" if $mgm_vlan;
+	push @{$command{"linksys"}}, "show spanning-tree detail";
+	push @{$command{"foxgate"}}, "sh dhcp-snooping interface ethernet 0/0/1 to ethernet 0/1/4";
+	push @{$command{"foxgate"}}, "sh spanning-tree mst config-id";
+	push @{$command{"ZTE"}}, "show ru";
+	push @{$command{"Dlink"}}, "show address_binding ports";
+	#push @{$command{"Dlink"}}, "show stp mst_config_id";
+	push @{$command{"Dlink"}}, "show vlan";
+	push @{$command{"Dlink"}}, "show igmp_snooping multicast_vlan";
+	push @{$command{"Dlink"}}, "show filter dhcp_server";
+	push @{$command{"Dlink"}}, "show dhcp_local_relay";
+	push @{$command{"Dlink"}}, "show loopdetect ports";
+	push @{$command{"Dlink"}}, "show loopdetect ports all";
+#	push @{$command{"Dlink"}}, "show stp instance 0";
+##### generating commands ###########
+	switch ($model){
+		case("ZTE"){
+	$prompts{more} = '\sPress\sQ';
+	$prompts{more_cli}='\(cfg.*\)#|\sPress\sQ';
+	$prompts{cli}='\(cfg.*\)#';
+		}
+		case("linksys"){
+	$prompts{more} = 'More:';
+	$prompts{more_cli}='#\s$|More:\s';
+	$prompts{cli}='#\s$';
+		}
+		case("Dlink"){
+	$prompts{more} = 'CTRL\+C';
+	$prompts{more_cli}='#$|(CTRL\+C)';
+	$prompts{cli}='#$';
+		}
+		case("foxgate"){
+	$prompts{more} = 'ENTER to next line';
+	$prompts{more_cli}='(#$)|(ENTER to next line)';
+	$prompts{cli}='#$';	
+		}
+	}
+#####################check stp#######################
+my $i=0;
+my $count;
+for my $command (@{$command{$models{$ip}}}){
+		my $array;
+		my $test;
+	switch ($command){
+	case ("sh spanning-tree mst-configuration"){
+		$key="stp";
+	}
+	case ("show stp mst_config_id"){
+		$key="stp";
+	}
+	case ("show stp instance 0"){
+		$key="stp";
+	}
+	case ("sh spanning-tree mst config-id"){
+		$key="stp";
+	}
+	case ("show vlan $mgm_vlan"){
+		$key="trunks";
+	}
+	case (m/show vlan/){
+		$key="vlan";
+	}
+	case ("show igmp_snooping multicast_vlan"){
+		$key="vlan";
+	}
+	case ("show filter dhcp_server"){
+		$key="dhcp";
+	}
+	case ("show dhcp_local_relay"){
+		$key="dhcp";
+	}
+	case (m/sh ip igmp snooping interface/){
+		$key="iptv";
+	}
+	case ("show spanning-tree detail"){
+		$key="portfast";
+	}
+	case ("sh vlan tag $mgm_vlan"){
+		$key="trunks";
+	}
+	case ("sh ip dhcp snooping"){
+		$key="dhcp";
+	}
+	case ("show address_binding ports"){
+		$key="dhcp";
+	}
+	case ("sh dhcp-snooping interface ethernet 0/0/1 to ethernet 0/1/4"){
+		$key="dhcp";
+	}
+	case ("show loopdetect ports"){
+		$key="loop";
+	}
+	case ("show loopdetect ports all"){
+		$key="loop";
+	}
+	else {
+		$key="config";
+	}
+	}
+
+$telnet->print ("$command");
+(my $arrays, my $match) = $telnet->waitfor(Match => "/$prompts{more_cli}/", Timeout => 5, Errmode => sub {warn "\n ################## Command $command error on $ip, something going wrong ################\n"; 
+		push @errors, "Command error on $ip, something going wrong";
+		} );
+while ($match =~ m/$prompts{more}/){
+	$array .=$arrays;
+	if ($command eq "show stp instance 0"){
+	#	print "Here last\n";
+		$telnet->put("q");
+		#last;
+	}
+
+	#$telnet->cmd (String => " ", Prompt => "/$prompts{more_cli}/", Timeout => 2);
+	$telnet->print(" ");
+	if ($command=~m/show loopdetect ports/){
+		$telnet->put("q");
+		last if $count>1;
+				$count++;
+	}
+
+	#$telnet->cmd (String => " ", Prompt => "/$prompts{more_cli}/", Timeout => 2);
+
+	($arrays, $match) = $telnet->waitfor(Match => "/$prompts{more_cli}/", Timeout => 3, Errmode => sub {
+			push @errors, "Command error on $ip, something going wrong";
+			next;} );
+
+	last if $match =~ m/$prompts{cli}/;
+	last if $arrays =~ m/Port\sg[1-4]\s(enabled|disabled)/;
+}
+
+	$array .=$arrays;
+	
+	#push @config, (split "\n", $array);
+	push @{$conf{$key}}, (split "\n", $array);
+
+}
+my $new_arr;
+if ($models{$ip} eq "Dlink"){
+	$telnet->print ("show stp mst_config_id");
+	(my $arrays, my $match) = $telnet->waitfor(Match => "/$prompts{more_cli}/", Timeout => 5, Errmode => sub {warn "\n ################## Command  error on $ip, something going wrong ################\n"; 
+		push @errors, "Command error on $ip, something going wrong";
+		} );
+	$new_arr.=$arrays;
+	push @{$conf{"stp"}}, (split "\n", $new_arr);
+
+	$telnet->print ("show stp mst_config_id");
+	(my $arrays, my $match) = $telnet->waitfor(Match => "/$prompts{more_cli}/", Timeout => 5, Errmode => sub {warn "\n ################## Command  error on $ip, something going wrong ################\n"; 
+		push @errors, "Command error on $ip, something going wrong";
+		} );
+	$telnet->put("q");
+	$new_arr.=$arrays;
+	push @{$conf{"stp"}}, (split "\n", $new_arr);
+	#print Dumper \@{$conf{"stp"}};
+}
+#print Dumper @config;
+$telnet->print("exit");
+$telnet->close;
+
+#return \@config;
+#print "End getting config subroutine $ip\n";
+return \%conf;
+}
+
+#################### work with switches #####################
+
+sub connect {
+my $ip = shift;
+my $model = shift;
+my $pm = shift;
+my $username = "vision";
+my $pass = "cjnjyf";
+my $ztepass = "RbnfqcrbqBynthyt";
+my %prompts;
+print "Start connecting subroutine $ip\n";
+	switch ($model){
+		case("ZTE"){
+	$prompts{login} = 'login:';
+	$prompts{pass} = 'password:';
+	$prompts{cli} = '>$';
+	$prompts{enable}='\(cfg\)#';
+		}
+		case("linksys"){
+	$prompts{login} = 'User Name:.*';
+	$prompts{pass} = 'Password:';
+	$prompts{cli} = '#\s$';	
+		}
+		case("Dlink"){
+	$prompts{login} = 'UserName:';
+	$prompts{pass} = 'PassWord:';
+	$prompts{cli} = '#$';
+	$prompts{enable} = '(PassWord:)|(#$)';	
+		}case("foxgate"){
+	$prompts{login} = 'Username:';
+	$prompts{pass} = 'Password:';
+	$prompts{cli} = '>$';
+	$prompts{enable} = '#$';
+		}else {
+		push @errors, "Login error on $ip (unknown switch model)";
+		print "$ip - unknown switch model\n";
+		$pm->finish(0,[$ip, "kill"]);
+		
+		}
+	}
+my $t = new Net::Telnet ();#Input_log=>\*STDOUT, Output_log=>\*STDOUT);
+    $t->open("$ip");
+    $t->waitfor(Match => "/$prompts{login}/", Timeout => 3, Errmode => sub{warn "\n #############################\n can't login to $ip - auth error\n#######################\n";
+		push @errors, "Login error on $ip";
+		$t->close;
+		$pm->finish(0,[$ip, "kill"]);
+		next;} );
+    $t->cmd (String => $username, Prompt => "/$prompts{pass}/", Timeout => 3,
+		Errmode => sub{warn "\n #############################\n can't login to $ip - auth error\n#######################\n";
+		push @errors, "Auth error on $ip, possible bad radius";
+		$t->close;
+		$pm->finish(0,[$ip, "kill"]);
+		next;}
+	);
+
+	$t->cmd (String => $pass, Prompt => "/$prompts{cli}/", Timeout => 10, 
+		Errmode => sub {warn "\n ################## can't login to $ip - pass error ################\n"; 
+		push @errors, "Auth error on $ip, possible bad radius";
+		$t->close;
+		$pm->finish(0,[$ip, "kill"]);
+		next;});
+		
+if ("$model" eq "ZTE"){
+#	print "Identify ZTE-switch \n";
+	#$t->waitfor(Match => '/.*>$/', Timeout => 3 );
+    $t->cmd (String => "en", Prompt => "/$prompts{pass}/", Timeout => 5, Errmode => sub {warn "\n ################## can't enable to $ip - pass error ################\n"; 
+		push @errors, "Enable error on $ip, something going wrong";
+		$t->close;
+		$pm->finish(0,[$ip, "kill"]);
+		next;});
+    $t->cmd (String => $ztepass, Prompt => "/$prompts{enable}/", Timeout => 5, Errmode => sub {warn "\n ################## can't enable to $ip - pass error ################\n"; 
+		push @errors, "Enable error on $ip, something going wrong";
+		$t->close;
+		$pm->finish(0,[$ip, "kill"]);
+		next;});
+ #   print "Enable successed \n";
+ 
+}elsif ("$model" eq "Dlink"){
+	$t->cmd (String => "enable admin", Prompt => "/$prompts{enable}/", Timeout => 4);#, Errmode => sub{ warn "\n $ip is not D-link A1/B1";});
+	$t->cmd (String => "", Prompt => '/.*/', Timeout => 4);
+	$t->waitfor(Match => "/$prompts{cli}/", Timeout => 2, Errmode => sub { warn "\n ################## can't enable to $ip - enable error ################\n"; 
+	push @errors, "$ip - Fucking D-link switch!";
+	$t->close;
+	$pm->finish(0,[$ip, "kill"]);
+	next;} );
+	$t->cmd (String => "enable clipaging", Prompt => "/$prompts{cli}/", Timeout => 4, Errmode => sub { warn "\n ################## can't enable clipaging in $ip - enable error ################\n"; 
+	push @errors, "$ip - Fucking D-link switch!";
+	$t->close;
+	$pm->finish(0,[$ip, "kill"]);
+	next;} );
+}elsif ("$model" eq "foxgate"){
+	$t->cmd (String => "enable", Prompt => "/$prompts{enable}/", Timeout => 4, Errmode => sub { warn "\n ################## can't enable to $ip - enable error ################\n"; 
+	push @errors, "$ip - Fucking FoxGate switch!";
+	$t->close;
+	$pm->finish(0,[$ip, "kill"]);
+	next;});
+}
+#print "$ip - login done \n";
+
+return $t;
+}
+print "выполнено за ".(time() - $start_time)." сек\n";
