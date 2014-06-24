@@ -1,3 +1,4 @@
+#!/usr/bin/perl
 {package routers;
 #########################
 use strict;
@@ -22,25 +23,48 @@ use Net::Ping;
 		unless (&check_available($self->{ip})){
 			print "$self->{ip} host is dead\n";
 			return 0;
+			#next;
 		}
 		$self->{hostname} = $self->get_hostname();
+		unless ($self->{hostname}) {
+			warn "cannot resolve hostname for $self->{ip}"; 
+			next;
+		}
 		$self->{model} = $self->get_model();
-
+		unless ($self->{model}) {
+			warn "cannot resolve hostname for $self->{ip}"; 
+			next;
+		}
 		switch ($self->{model}){
 			case("zte"){
 		$prompts{more} = "--More--";
 		$prompts{more_cli}="($self->{hostname})|(--More--)";
 		$prompts{cli}="$self->{hostname}";
+		$prompts{login}="Username:";
+		$prompts{pass}="Password:";
+		$self->{login}="duty";
+		$self->{pass}="support";
 			}
 			case("cisco"){
 		$prompts{more} = '--More--';
 		$prompts{more_cli}="$self->{hostname}|--More--";
 		$prompts{cli}="$self->{hostname}";
+		$prompts{login}="Username:";
+		$prompts{pass}="Password:";
+		$self->{login}="vision" if (!$self->{login});
+		$self->{pass}="rbyctler" if (!$self->{pass});
 			}
 			case("huawei"){
 		$prompts{more} = '---- More ----';
 		$prompts{cli}="$self->{hostname}";
 		$prompts{more_cli}="$self->{hostname}|---- More ----";
+		$prompts{login}="Username:";
+		$prompts{pass}="Password:";
+		$self->{login}="noc";
+		$self->{pass}="NocO3noC";
+			}
+			case("dlink"){
+
 			}
 		}
 
@@ -78,8 +102,11 @@ use Net::Ping;
 			case(/S5328C-EI-24S/){
 				$model = "huawei";
 			}
+			case(/DXS/){
+				$model= "dlink";
+			}
 			else{
-
+				$model = "unknow model";
 			}
 		}
 		return $model;
@@ -98,13 +125,9 @@ use Net::Ping;
 	sub connect {
 		my $self = shift;
 		my $ip = $self->{ip};
-		my $enable = $self->{enable};
 		my $hostname = $self->{hostname};
 		my $login = $self->{login} || "vision";
 		my $pass = $self->{pass} || "rbyctler";
-		#Input_log=>\*STDOUT, Output_log=>\*STDOUT); 
-		#print Dumper \$self;
-		print "connecting to $hostname\n";
 		$self->{telnet} = new Net::Telnet (Timeout => 5, Errmode => sub {
 			my $position;
 			sub position {
@@ -119,49 +142,28 @@ use Net::Ping;
 					print "next trying\n";
 					$self->connect();
 				}else{
+					print "Fail with $self->{hostname}";
 					next;
 					return;
 				}
 			}
 		});#,	Input_log=>\*STDOUT, Output_log=>\*STDOUT);
-		if ($self->{model} eq "cisco"){
-
-			$self->{telnet}->open ("$ip");
-
-			$self->{telnet}->waitfor(Match => "/Username:/", Timeout => 10, Errmode => sub {$self->position("cannot connect to $hostname");});
-			$self->{telnet}->cmd(String => "$login", Prompt => "/Password:/", Timeout => 5, Errmode => sub {$self->position("\ncannot login on $hostname\n")});
-			$self->{telnet}->cmd(String => "$pass", Prompt => "/$hostname#/", Timeout => 5, Errmode => sub {$self->position("\ncannot enter on $hostname\n")});
-			if ($self->{mode} eq "config"){
-				$self->{telnet}->cmd(String => "configure terminal", Prompt => "/$hostname.*#/", Timeout => 5, Errmode => sub {$self->position("\ncannot configure on $hostname\n")});
-			}
-
-		}elsif($self->{model} eq "zte"){
-
-			$self->{telnet}->open ("$ip");
-
-			$self->{telnet}->waitfor(Match => "/Username:/", Timeout => 10, Errmode => sub {$self->position("cannot connect to $hostname");});
-			$self->{telnet}->cmd(String => "duty", Prompt => "/Password:/", Timeout => 5, Errmode=>sub {$self->position("cannot login to $hostname");});
-			$self->{telnet}->cmd(String => "support", Prompt => "/$hostname/", Timeout => 5, Errmode => sub {$self->position("cannot enter on $hostname")});
-			if ($self->{enable}){
-				$self->{telnet}->cmd(String => "enable", Prompt => "/Password:/", Timeout => 5, Errmode => sub {$self->position("cannot enable on $hostname")});
-			}
-			if ($self->{mode} eq "config"){
-				$self->{telnet}->cmd(String => "$enable", Prompt => "/$hostname#/", Timeout => 5, Errmode => sub {$self->position("\ncannot enable on $hostname\n")});
-				$self->{telnet}->cmd(String => "configure terminal", Prompt => "/$hostname#/", Timeout => 5, Errmode => sub {$self->position("\ncannot configure on $hostname\n")});
-			}
-			
-		}elsif($self->{model} eq "huawei"){
-
+		
 		$self->{telnet}->open ("$ip");
 
-		$self->{telnet}->waitfor(Match => "/Username:/", Timeout => 10);
-		$self->{telnet}->cmd(String => "noc", Prompt => "/Password:/", Timeout => 5, Errmode => sub {$self->position("\ncannot login on $hostname\n")});
-		$self->{telnet}->cmd(String => "NocO3noC", Prompt => "/<$hostname>/", Timeout => 5, Errmode => sub {$self->position("\ncannot enter on $hostname\n")});
-			if ($self->{mode} eq "config"){
-				$self->{telnet}->cmd(String => "system-view", Prompt => "/[$hostname]/", Timeout => 5, Errmode => sub {$self->position("\ncannot configure on $hostname\n")});
-			}
-
+		$self->{telnet}->waitfor(Match => "/$prompts{login}/", Timeout => 10, Errmode => sub {$self->position("cannot connect to $hostname");});
+		$self->{telnet}->cmd(String => $self->{login}, Prompt => "/$prompts{pass}/", Timeout => 5, Errmode => sub {$self->position("\ncannot login on $hostname\n")});
+		$self->{telnet}->cmd(String => $self->{pass}, Prompt => "/$prompts{cli}/", Timeout => 5, Errmode => sub {$self->position("\ncannot enter on $hostname\n")});
+		
+		if ($self->{enable}){
+			$self->{telnet}->cmd(String => "enable", Prompt => "/$prompts{pass}/", Timeout => 5, Errmode => sub {$self->position("cannot enable on $hostname")});
+			$self->{telnet}->cmd(String => "$self->{enable}", Prompt => "/$prompts{cli}/", Timeout => 5, Errmode => sub {$self->position("\ncannot enable on $hostname\n")});
 		}
+
+		if ($self->{mode} eq "config"){
+			$self->{telnet}->cmd(String => "configure terminal", Prompt => "/$prompts{cli}/", Timeout => 5, Errmode => sub {$self->position("\ncannot configure on $hostname\n")});
+		}
+
 		return 1;
 	}
 
@@ -173,7 +175,6 @@ use Net::Ping;
 		for my $command (@command){
 			my $array;
 			$self->{telnet}->print ("$command");
-			#print Dumper \%prompts;
 			(my $arrays, my $match) = $self->{telnet}-> waitfor(Match => "/$prompts{more_cli}/", Timeout => 20, Errmode => sub {$self->position("trouble with command $command\n")});
 			$array.=$arrays;
 			while ($match =~ m/$prompts{more}/){
@@ -193,7 +194,7 @@ use Net::Ping;
 		return $self->{result}->{$command} if ($command);
 		my $result;
 		for my $command (keys %{$self->{result}}){
-			$result.="$command\n";
+			#$result.="$command\n";
 			$result.=$self->{result}->{$command};
 		}
 		return $result;
