@@ -16,11 +16,7 @@ my $user = 'vision';
 my $pass = '8h1VwHxaD3lm3yIU';
 my $host='94.76.107.50';
 my $dbh = DBI->connect("dbi:mysql:billing:$host", "$user", "$pass");
-my $sql="select cs.ip, cs.name 
-from cisco cs 
-join houses h on cs.h_id=h.h_id
-join csc_seg c_s on h.csc_seg_id=c_s.id 
-join csc c on c_s.csc_id=c.id where cs.id in ('149','128','169','5');";# where model_id=16 limit 10";
+my $sql="select cs.ip, cs.name from cisco cs ;";
 my $sth= $dbh->prepare($sql);
 $sth->execute or die "SQL Error: $DBI::errstr\n";
 my @row;
