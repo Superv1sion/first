@@ -1406,8 +1406,6 @@ if ("$model" eq "ZTE"){
 	$pm->finish(0,[$ip, "kill"]);
 	next;});
 }
-#print "$ip - login done \n";
-
 return $t;
 }
 print "выполнено за ".(time() - $start_time)." сек\n";
