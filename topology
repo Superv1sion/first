@@ -8,7 +8,6 @@ use Storable;
 #########################
 use lib("/home/vision/perl");
 
-
 my @ips;
 my %ip_name;
 my %errors;
