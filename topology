@@ -33,10 +33,7 @@ my $hash = retrieve ('ip_mac');
 my %ip_mac = %{$hash};
 my $count;
 my %ports_neighbors;
-#@ips = &check_alives(\@ips);
 
-print Dumper \@ips;
-#sleep 4;
 for my $ip (@ips){
 	$count++;
 	my %commands_reg;
