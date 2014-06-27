@@ -17,7 +17,6 @@ use Net::Ping;
 		my $self = shift;
 		my %oids;
 		bless $self, $class;
-		#print Dumper \$self;
 		$self->{mode} = "view" if (!$self->{mode});
 		$self->{community} = "Ssgp17ifWk";
 		unless (&check_available($self->{ip})){
