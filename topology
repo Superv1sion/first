@@ -1,0 +1,216 @@
+#!/usr/bin/perl
+#########################
+use strict;
+use Data::Dumper;
+use routers;
+use DBI;
+use Storable;
+#########################
+use lib("/home/vision/perl_oop");
+
+
+my @ips;
+my %ip_name;
+my %errors;
+my $user = 'vision';
+my $pass = '8h1VwHxaD3lm3yIU';
+my $host='94.76.107.50';
+my $dbh = DBI->connect("dbi:mysql:billing:$host", "$user", "$pass");
+my $sql="select cs.ip, cs.name 
+from cisco cs 
+join houses h on cs.h_id=h.h_id
+join csc_seg c_s on h.csc_seg_id=c_s.id 
+join csc c on c_s.csc_id=c.id where cs.id in ('149','128','169','5');";# where model_id=16 limit 10";
+my $sth= $dbh->prepare($sql);
+$sth->execute or die "SQL Error: $DBI::errstr\n";
+my @row;
+while (@row  = $sth->fetchrow_array){
+	my $ip = shift @row;
+	my $name = shift @row;
+	$ip_name{$ip}=$name;
+	push @ips, $ip;
+}
+@ips = &check_alives(\@ips);
+my @corpses;
+&ip_mac(\@ips);
+my $hash = retrieve ('ip_mac');
+my %ip_mac = %{$hash};
+my $count;
+my %ports_neighbors;
+#@ips = &check_alives(\@ips);
+
+print Dumper \@ips;
+#sleep 4;
+for my $ip (@ips){
+	$count++;
+	my %commands_reg;
+
+	my $router = new routers ({ip=>$ip});
+	$router->connect();
+	for my $neighbor (@ips){
+		my @result;
+		if ($ip_mac{$neighbor}){
+			if ($ip ne $neighbor){
+				if ($router->{model} eq "huawei"){
+					$ip_mac{$neighbor}=~s/\./-/g;
+					$commands_reg{command}="display mac-address $ip_mac{$neighbor}";
+					$commands_reg{reg}="([a-z]+[0-9]+\/[0-9]+\/[0-9]+)";
+				}elsif($router->{model} eq "cisco"){
+					$ip_mac{$neighbor}=~s/-/\./g;
+					$commands_reg{command}="show mac address-table address $ip_mac{$neighbor}";
+					$commands_reg{reg}="([a-z]+[0-9]+\/[0-9]+)";
+				}elsif($router->{model} eq "zte"){
+					$ip_mac{$neighbor}=~s/-/\./g;
+					$commands_reg{command}="show mac $ip_mac{$neighbor}";
+					$commands_reg{reg}="([a-z]+_[0-9]+\/[0-9]+)";
+				}
+				$router->exec($commands_reg{command});
+				@result=split (/\n/, $router->result());
+		
+				for my $str (@result){
+					if ($str=~m/$commands_reg{reg}/i){
+						$ports_neighbors{$ip}{$1}{$neighbor}='1';
+					}
+				}
+				#print $router->result;
+			}
+			undef $router->{result};
+		}else{
+			&error_log($neighbor, "No mac address aggr");
+		}
+	}
+	
+}
+print Dumper \%ports_neighbors;
+loop:for my $ip (@ips){
+	for my $port (keys %{$ports_neighbors{$ip}}){
+		my @temp;
+		for my $neighbor (keys %{$ports_neighbors{$ip}{$port}}){
+			push @temp, $neighbor;
+		}
+		#print "$ip ===> ";
+		#print Dumper \$ports_neighbors{$ip};
+		if ((scalar @temp)>1){
+			my $neighbor = &who_is_neighbor(\@temp,\%ports_neighbors);
+			unless ($neighbor) {
+
+				#&error_log($ip, "Cannot determine neighbor on $port");
+				$neighbor = shift @temp;
+				#print "go next\n";
+				#next loop;
+			}
+			#print "for $ip neighbor is $neighbor on $port\n";
+			undef $ports_neighbors{$ip}{$port};
+			$ports_neighbors{$ip}{$port}{$neighbor}='1';
+			for my $applicants (@temp){
+				if ($applicants ne $neighbor){
+					for my $ports (keys %{$ports_neighbors{$applicants}}){
+						if ($ports_neighbors{$applicants}{$ports}{$ip} eq "1"){
+							undef $ports_neighbors{$applicants}{$ports};
+							#print "\n And added $neighbor\n";
+							$ports_neighbors{$applicants}{$ports}{$neighbor}='1';
+						}
+					}
+				}
+			}
+		}
+	}
+}
+#store \%ports_neighbors, "ports_neighbors";
+
+print Dumper \%errors;
+print Dumper \%ports_neighbors;
+print Dumper \@routers::error;
+print Dumper \@corpses;
+
+
+sub check_alives {
+	my @ip = @{$_[0]};
+	my @result;
+	for my $ip (@ip){
+		my $router = new routers ({ip=>$ip});
+		if ($router){
+			push @result, $ip;
+		}else{
+			&error_log($ip, "Router is dead!");
+		}
+	}
+	return @result;
+}
+
+sub who_is_neighbor {
+	my @neighbors = @{$_[0]};
+	my %ports_neighbors = %{$_[1]};
+	#print Dumper $ports_neighbors{'10.222.222.30'};
+	#print Dumper \@neighbors;
+	my $count;
+	my $max;
+	my $winner;
+	my @applicants;
+	for my $ip  (@neighbors){
+		$count=0;
+		for my $ports (keys %{$ports_neighbors{$ip}}){
+				$count+=(keys %{$ports_neighbors{$ip}{$ports}});
+		}
+		if ($max<$count){
+			$max=$count;
+			$winner=$ip;
+		}elsif($max==$count){
+			$winner='';
+		}
+		#push @applicants, $ip;
+		print "$ip has ".$count." neighbors \n";
+	}
+	#print Dumper \@applicants;
+	if (!$winner){
+		$max=0;
+		my $used_ports;
+		for my $ip (@neighbors){
+			$used_ports=(keys %{$ports_neighbors{$ip}});
+			if ($max<$used_ports){
+				$max=$used_ports;
+				$winner=$ip;
+			}elsif($max==$used_ports){
+				$winner='';
+			}
+			print "$ip has ".$used_ports." used ports \n";
+		}
+	}
+	if ($winner){
+		print "Winner is $winner\n";
+		return $winner;
+	}else{
+		print "no winner (((\n";
+		return 0;
+	}
+}
+sub ip_mac{
+	my @ips = @{$_[0]};
+	for my $ip (@ips){
+		my $router = new routers({ip => $ip});#, mode => "config"});
+		unless ($router){
+			push @corpses, $ip;
+			next;
+		}
+		#print Dumper \$router;
+		$router->connect();
+		if ($router->{model} eq "huawei"){
+			$router->exec("disp arp | include I - ");	
+		}elsif($router->{model} eq "cisco"){
+			$router->exec("show arp | in -");
+		}elsif($router->{model} eq "zte"){
+			$router->exec("show arp static");
+		}
+		my $result = $router->result();
+		if ($result=~m/((:?[a-f0-9]{2}[.:-]){5}[a-f0-9]{2}|(?:[a-f0-9]{4}[.:-]){2}[a-f0-9]{4})/i){
+			print "$1\n";
+			$ip_mac{$ip}=$1;
+		}
+	}
+	store \%ip_mac, 'ip_mac';
+}
+sub error_log{
+	my $ip = shift;
+	my $error=shift;
+	push @{$errors{$ip}}, $error;
+}
