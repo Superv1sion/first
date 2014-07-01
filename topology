@@ -6,7 +6,8 @@ use routers;
 use DBI;
 use Storable;
 #########################
-use lib("/home/vision/perl");
+use lib("/home/vision/perl_oop");
+
 
 my @ips;
 my %ip_name;
@@ -15,7 +16,11 @@ my $user = 'vision';
 my $pass = '8h1VwHxaD3lm3yIU';
 my $host='94.76.107.50';
 my $dbh = DBI->connect("dbi:mysql:billing:$host", "$user", "$pass");
-my $sql="select cs.ip, cs.name from cisco cs ;";
+my $sql="select cs.ip, cs.name 
+from cisco cs 
+join houses h on cs.h_id=h.h_id
+join csc_seg c_s on h.csc_seg_id=c_s.id 
+join csc c on c_s.csc_id=c.id where c.id=11";
 my $sth= $dbh->prepare($sql);
 $sth->execute or die "SQL Error: $DBI::errstr\n";
 my @row;
@@ -32,7 +37,9 @@ my $hash = retrieve ('ip_mac');
 my %ip_mac = %{$hash};
 my $count;
 my %ports_neighbors;
+#@ips = &check_alives(\@ips);
 
+print Dumper \@ips;
 for my $ip (@ips){
 	$count++;
 	my %commands_reg;
@@ -61,7 +68,7 @@ for my $ip (@ips){
 		
 				for my $str (@result){
 					if ($str=~m/$commands_reg{reg}/i){
-						$ports_neighbors{$ip}{$1}{$neighbor}='1';
+						$ports_neighbors{$ip}{$1}{$neighbor}=1;
 					}
 				}
 				#print $router->result;
@@ -80,18 +87,13 @@ loop:for my $ip (@ips){
 		for my $neighbor (keys %{$ports_neighbors{$ip}{$port}}){
 			push @temp, $neighbor;
 		}
-		#print "$ip ===> ";
-		#print Dumper \$ports_neighbors{$ip};
 		if ((scalar @temp)>1){
-			my $neighbor = &who_is_neighbor(\@temp,\%ports_neighbors);
+			my $neighbor = &who_is_neighbor(\@temp,\%ports_neighbors, $ip);
 			unless ($neighbor) {
-
-				#&error_log($ip, "Cannot determine neighbor on $port");
-				$neighbor = shift @temp;
-				#print "go next\n";
-				#next loop;
+				print "go next\n";
+				$ports_neighbors{$ip}{$port}{loop}='1';
+				next loop;
 			}
-			#print "for $ip neighbor is $neighbor on $port\n";
 			undef $ports_neighbors{$ip}{$port};
 			$ports_neighbors{$ip}{$port}{$neighbor}='1';
 			for my $applicants (@temp){
@@ -99,8 +101,8 @@ loop:for my $ip (@ips){
 					for my $ports (keys %{$ports_neighbors{$applicants}}){
 						if ($ports_neighbors{$applicants}{$ports}{$ip} eq "1"){
 							undef $ports_neighbors{$applicants}{$ports};
-							#print "\n And added $neighbor\n";
-							$ports_neighbors{$applicants}{$ports}{$neighbor}='1';
+
+							$ports_neighbors{$applicants}{$ports}{$neighbor}=1;
 						}
 					}
 				}
@@ -133,6 +135,7 @@ sub check_alives {
 sub who_is_neighbor {
 	my @neighbors = @{$_[0]};
 	my %ports_neighbors = %{$_[1]};
+	my $parent=$_[2];
 	#print Dumper $ports_neighbors{'10.222.222.30'};
 	#print Dumper \@neighbors;
 	my $count;
@@ -141,8 +144,15 @@ sub who_is_neighbor {
 	my @applicants;
 	for my $ip  (@neighbors){
 		$count=0;
+		$count+=(keys %{$ports_neighbors{$ip}});
 		for my $ports (keys %{$ports_neighbors{$ip}}){
-				$count+=(keys %{$ports_neighbors{$ip}{$ports}});
+			my %ne;
+			for my $ne (@neighbors){
+				if ($ports_neighbors{$ip}{$ports}{$ne}){
+					$ne{$ne}='';
+				}
+			}
+			$count+=(keys %ne);
 		}
 		if ($max<$count){
 			$max=$count;
@@ -150,15 +160,24 @@ sub who_is_neighbor {
 		}elsif($max==$count){
 			$winner='';
 		}
+		
 		#push @applicants, $ip;
-		print "$ip has ".$count." neighbors \n";
+		print "parent $parent;  $ip has ".$count." priority \n";
+
 	}
-	#print Dumper \@applicants;
 	if (!$winner){
 		$max=0;
+		my %used_ports;
 		my $used_ports;
 		for my $ip (@neighbors){
-			$used_ports=(keys %{$ports_neighbors{$ip}});
+			for my $ports (keys %{$ports_neighbors{$ip}}){
+				for my $ne (@neighbors){
+					if ($ports_neighbors{$ip}{$ports}{$ne}){
+						$used_ports{$ports}='';
+					}
+				}
+			}
+			$used_ports=(keys %used_ports);
 			if ($max<$used_ports){
 				$max=$used_ports;
 				$winner=$ip;
@@ -172,7 +191,7 @@ sub who_is_neighbor {
 		print "Winner is $winner\n";
 		return $winner;
 	}else{
-		print "no winner (((\n";
+		print "no winner, probably loop (((\n";
 		return 0;
 	}
 }
